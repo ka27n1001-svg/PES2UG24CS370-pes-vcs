@@ -1,11 +1,14 @@
 # Compiled binaries
 pes
+pes_asan
 test_objects
 test_tree
 
 # Object files
 *.o
 *.obsidian
+core
+core.*
 
 # PES repository (created during testing)
 .pes/
@@ -16,5 +19,4 @@ test_tree
 *~
 .vscode/
 .idea/
-
 

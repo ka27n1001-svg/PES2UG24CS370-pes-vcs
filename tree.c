@@ -10,17 +10,47 @@
 //   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
 
 #include "tree.h"
+#include "index.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <errno.h>
 
 // ─── Mode Constants ─────────────────────────────────────────────────────────
 
 #define MODE_FILE      0100644
 #define MODE_EXEC      0100755
 #define MODE_DIR       0040000
+
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
+
+typedef struct {
+    uint32_t mode;
+    ObjectID hash;
+    char name[256];
+} PendingFile;
+
+typedef struct PendingTreeNode {
+    char name[256];
+    PendingFile *files;
+    size_t file_count;
+    size_t file_cap;
+    struct PendingTreeNode *dirs;
+    size_t dir_count;
+    size_t dir_cap;
+} PendingTreeNode;
+
+static int load_index_snapshot(Index *index);
+static PendingTreeNode *find_subdir(PendingTreeNode *node, const char *name);
+static int ensure_dir_capacity(PendingTreeNode *node);
+static int ensure_file_capacity(PendingTreeNode *node);
+static PendingTreeNode *get_or_add_subdir(PendingTreeNode *node, const char *name);
+static int add_file_entry(PendingTreeNode *node, const char *name, uint32_t mode, const ObjectID *hash);
+static int insert_index_entry(PendingTreeNode *root, const IndexEntry *entry);
+static void free_pending_tree(PendingTreeNode *node);
+static int write_tree_recursive(PendingTreeNode *node, ObjectID *id_out);
 
 // ─── PROVIDED ───────────────────────────────────────────────────────────────
 
@@ -130,8 +160,237 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 //
 // Returns 0 on success, -1 on error.
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    Index index;
+    PendingTreeNode root;
+
+    if (!id_out) return -1;
+
+    if (load_index_snapshot(&index) != 0) return -1;
+
+    memset(&root, 0, sizeof(root));
+    root.name[0] = '\0';
+
+    for (int i = 0; i < index.count; i++) {
+        if (insert_index_entry(&root, &index.entries[i]) != 0) {
+            free_pending_tree(&root);
+            return -1;
+        }
+    }
+
+    if (write_tree_recursive(&root, id_out) != 0) {
+        free_pending_tree(&root);
+        return -1;
+    }
+
+    free_pending_tree(&root);
+    return 0;
+}
+
+static int compare_pending_dirs(const void *a, const void *b) {
+    const PendingTreeNode *lhs = (const PendingTreeNode *)a;
+    const PendingTreeNode *rhs = (const PendingTreeNode *)b;
+    return strcmp(lhs->name, rhs->name);
+}
+
+static int load_index_snapshot(Index *index) {
+    FILE *f;
+    char line[2048];
+
+    index->count = 0;
+
+    f = fopen(INDEX_FILE, "r");
+    if (!f) return errno == ENOENT ? 0 : -1;
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        unsigned int mode;
+        unsigned long long mtime_sec;
+        unsigned int size;
+        char hash_hex[HASH_HEX_SIZE + 1];
+        char path[sizeof(index->entries[0].path)];
+        IndexEntry *entry;
+
+        if (index->count >= MAX_INDEX_ENTRIES) {
+            fclose(f);
+            return -1;
+        }
+
+        if (sscanf(line, "%o %64s %llu %u %511[^\n]", &mode, hash_hex, &mtime_sec, &size, path) != 5) {
+            fclose(f);
+            return -1;
+        }
+
+        entry = &index->entries[index->count];
+        entry->mode = mode;
+        entry->mtime_sec = (uint64_t)mtime_sec;
+        entry->size = size;
+        snprintf(entry->path, sizeof(entry->path), "%s", path);
+        if (hex_to_hash(hash_hex, &entry->hash) != 0) {
+            fclose(f);
+            return -1;
+        }
+
+        index->count++;
+    }
+
+    if (ferror(f)) {
+        fclose(f);
+        return -1;
+    }
+
+    fclose(f);
+    return 0;
+}
+
+static PendingTreeNode *find_subdir(PendingTreeNode *node, const char *name) {
+    for (size_t i = 0; i < node->dir_count; i++) {
+        if (strcmp(node->dirs[i].name, name) == 0) return &node->dirs[i];
+    }
+    return NULL;
+}
+
+static int ensure_dir_capacity(PendingTreeNode *node) {
+    PendingTreeNode *dirs;
+    size_t new_cap;
+
+    if (node->dir_count < node->dir_cap) return 0;
+
+    new_cap = node->dir_cap == 0 ? 4 : node->dir_cap * 2;
+    dirs = realloc(node->dirs, new_cap * sizeof(*dirs));
+    if (!dirs) return -1;
+
+    node->dirs = dirs;
+    node->dir_cap = new_cap;
+    return 0;
+}
+
+static int ensure_file_capacity(PendingTreeNode *node) {
+    PendingFile *files;
+    size_t new_cap;
+
+    if (node->file_count < node->file_cap) return 0;
+
+    new_cap = node->file_cap == 0 ? 4 : node->file_cap * 2;
+    files = realloc(node->files, new_cap * sizeof(*files));
+    if (!files) return -1;
+
+    node->files = files;
+    node->file_cap = new_cap;
+    return 0;
+}
+
+static PendingTreeNode *get_or_add_subdir(PendingTreeNode *node, const char *name) {
+    PendingTreeNode *dir = find_subdir(node, name);
+    if (dir) return dir;
+
+    for (size_t i = 0; i < node->file_count; i++) {
+        if (strcmp(node->files[i].name, name) == 0) return NULL;
+    }
+
+    if (ensure_dir_capacity(node) != 0) return NULL;
+
+    dir = &node->dirs[node->dir_count++];
+    memset(dir, 0, sizeof(*dir));
+    snprintf(dir->name, sizeof(dir->name), "%s", name);
+    return dir;
+}
+
+static int add_file_entry(PendingTreeNode *node, const char *name, uint32_t mode, const ObjectID *hash) {
+    PendingFile *file;
+
+    if (find_subdir(node, name) != NULL) return -1;
+
+    for (size_t i = 0; i < node->file_count; i++) {
+        if (strcmp(node->files[i].name, name) == 0) {
+            node->files[i].mode = mode;
+            node->files[i].hash = *hash;
+            return 0;
+        }
+    }
+
+    if (ensure_file_capacity(node) != 0) return -1;
+
+    file = &node->files[node->file_count++];
+    file->mode = mode;
+    file->hash = *hash;
+    snprintf(file->name, sizeof(file->name), "%s", name);
+    return 0;
+}
+
+static int insert_index_entry(PendingTreeNode *root, const IndexEntry *entry) {
+    PendingTreeNode *node = root;
+    const char *component = entry->path;
+
+    if (entry->path[0] == '\0') return -1;
+
+    while (1) {
+        const char *slash = strchr(component, '/');
+        char name[256];
+        size_t name_len = slash ? (size_t)(slash - component) : strlen(component);
+
+        if (name_len == 0 || name_len >= sizeof(name)) return -1;
+        memcpy(name, component, name_len);
+        name[name_len] = '\0';
+
+        if (!slash) return add_file_entry(node, name, entry->mode, &entry->hash);
+
+        node = get_or_add_subdir(node, name);
+        if (!node) return -1;
+        component = slash + 1;
+        if (*component == '\0') return -1;
+    }
+}
+
+static void free_pending_tree(PendingTreeNode *node) {
+    for (size_t i = 0; i < node->dir_count; i++) {
+        free_pending_tree(&node->dirs[i]);
+    }
+
+    free(node->dirs);
+    free(node->files);
+}
+
+static int write_tree_recursive(PendingTreeNode *node, ObjectID *id_out) {
+    Tree tree;
+    void *data = NULL;
+    size_t len = 0;
+    int rc;
+
+    memset(&tree, 0, sizeof(tree));
+
+    qsort(node->dirs, node->dir_count, sizeof(*node->dirs), compare_pending_dirs);
+
+    if (node->file_count + node->dir_count > MAX_TREE_ENTRIES) return -1;
+
+    for (size_t i = 0; i < node->file_count; i++) {
+        TreeEntry *entry = &tree.entries[tree.count++];
+        entry->mode = node->files[i].mode;
+        entry->hash = node->files[i].hash;
+        snprintf(entry->name, sizeof(entry->name), "%s", node->files[i].name);
+    }
+
+    for (size_t i = 0; i < node->dir_count; i++) {
+        ObjectID child_id;
+        TreeEntry *entry;
+
+        if (write_tree_recursive(&node->dirs[i], &child_id) != 0) {
+            free(data);
+            return -1;
+        }
+
+        entry = &tree.entries[tree.count++];
+        entry->mode = MODE_DIR;
+        entry->hash = child_id;
+        snprintf(entry->name, sizeof(entry->name), "%s", node->dirs[i].name);
+    }
+
+    if (tree.count == 0) {
+        return object_write(OBJ_TREE, "", 0, id_out);
+    }
+
+    rc = tree_serialize(&tree, &data, &len);
+    if (rc != 0) return -1;
+
+    rc = object_write(OBJ_TREE, data, len, id_out);
+    free(data);
+    return rc;
 }
