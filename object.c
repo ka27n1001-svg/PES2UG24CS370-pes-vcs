@@ -94,9 +94,89 @@ int object_exists(const ObjectID *id) {
 //
 // Returns 0 on success, -1 on error.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    // TODO: Implement
-    (void)type; (void)data; (void)len; (void)id_out;
-    return -1;
+    const char *type_str;
+    char header[64];
+    int header_len;
+    size_t object_len;
+    unsigned char *object_buf = NULL;
+    char final_path[512];
+    char shard_dir[512];
+    char temp_path[640];
+    char *slash;
+    int temp_fd = -1;
+    int dir_fd = -1;
+    int rc = -1;
+
+    if ((!data && len != 0) || !id_out) return -1;
+
+    switch (type) {
+        case OBJ_BLOB:   type_str = "blob"; break;
+        case OBJ_TREE:   type_str = "tree"; break;
+        case OBJ_COMMIT: type_str = "commit"; break;
+        default: return -1;
+    }
+
+    header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len);
+    if (header_len < 0 || (size_t)header_len + 1 > sizeof(header)) return -1;
+    header[header_len++] = '\0';
+
+    object_len = (size_t)header_len + len;
+    object_buf = malloc(object_len);
+    if (!object_buf) return -1;
+
+    memcpy(object_buf, header, (size_t)header_len);
+    memcpy(object_buf + header_len, data, len);
+
+    compute_hash(object_buf, object_len, id_out);
+    if (object_exists(id_out)) {
+        rc = 0;
+        goto cleanup;
+    }
+
+    object_path(id_out, final_path, sizeof(final_path));
+    snprintf(shard_dir, sizeof(shard_dir), "%s", final_path);
+    slash = strrchr(shard_dir, '/');
+    if (!slash) goto cleanup;
+    *slash = '\0';
+
+    if (mkdir(shard_dir, 0755) != 0 && access(shard_dir, F_OK) != 0) goto cleanup;
+
+    if (snprintf(temp_path, sizeof(temp_path), "%s/%s.tmp", shard_dir, slash + 1) >= (int)sizeof(temp_path)) {
+        goto cleanup;
+    }
+    temp_fd = open(temp_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (temp_fd < 0) goto cleanup;
+
+    size_t written = 0;
+    while (written < object_len) {
+        ssize_t n = write(temp_fd, object_buf + written, object_len - written);
+        if (n <= 0) goto cleanup;
+        written += (size_t)n;
+    }
+
+    if (fsync(temp_fd) != 0) goto cleanup;
+    if (close(temp_fd) != 0) {
+        temp_fd = -1;
+        goto cleanup;
+    }
+    temp_fd = -1;
+
+    if (rename(temp_path, final_path) != 0) goto cleanup;
+
+    dir_fd = open(shard_dir, O_RDONLY | O_DIRECTORY);
+    if (dir_fd < 0) goto cleanup;
+    if (fsync(dir_fd) != 0) goto cleanup;
+
+    rc = 0;
+
+cleanup:
+    if (dir_fd >= 0) close(dir_fd);
+    if (temp_fd >= 0) {
+        close(temp_fd);
+        unlink(temp_path);
+    }
+    free(object_buf);
+    return rc;
 }
 
 // Read an object from the store.
@@ -122,7 +202,68 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
 // The caller is responsible for calling free(*data_out).
 // Returns 0 on success, -1 on error (file not found, corrupt, etc.).
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    // TODO: Implement
-    (void)id; (void)type_out; (void)data_out; (void)len_out;
-    return -1;
+    char path[512];
+    FILE *f = NULL;
+    unsigned char *file_buf = NULL;
+    void *data_buf = NULL;
+    long file_size_long;
+    size_t file_size;
+    char *nul;
+    char type_str[16];
+    size_t parsed_len;
+    ObjectID actual_id;
+    int rc = -1;
+
+    if (!id || !type_out || !data_out || !len_out) return -1;
+
+    object_path(id, path, sizeof(path));
+    f = fopen(path, "rb");
+    if (!f) return -1;
+
+    if (fseek(f, 0, SEEK_END) != 0) goto cleanup;
+    file_size_long = ftell(f);
+    if (file_size_long < 0) goto cleanup;
+    file_size = (size_t)file_size_long;
+    if (fseek(f, 0, SEEK_SET) != 0) goto cleanup;
+
+    file_buf = malloc(file_size);
+    if (!file_buf && file_size != 0) goto cleanup;
+
+    if (file_size != 0 && fread(file_buf, 1, file_size, f) != file_size) goto cleanup;
+
+    nul = memchr(file_buf, '\0', file_size);
+    if (!nul) goto cleanup;
+
+    if (sscanf((char *)file_buf, "%15s %zu", type_str, &parsed_len) != 2) goto cleanup;
+
+    size_t header_len = (size_t)(nul - (char *)file_buf) + 1;
+    if (header_len + parsed_len != file_size) goto cleanup;
+
+    compute_hash(file_buf, file_size, &actual_id);
+    if (memcmp(actual_id.hash, id->hash, HASH_SIZE) != 0) goto cleanup;
+
+    if (strcmp(type_str, "blob") == 0) {
+        *type_out = OBJ_BLOB;
+    } else if (strcmp(type_str, "tree") == 0) {
+        *type_out = OBJ_TREE;
+    } else if (strcmp(type_str, "commit") == 0) {
+        *type_out = OBJ_COMMIT;
+    } else {
+        goto cleanup;
+    }
+
+    data_buf = malloc(parsed_len);
+    if (!data_buf && parsed_len != 0) goto cleanup;
+    memcpy(data_buf, file_buf + header_len, parsed_len);
+
+    *data_out = data_buf;
+    *len_out = parsed_len;
+    data_buf = NULL;
+    rc = 0;
+
+cleanup:
+    if (f) fclose(f);
+    free(file_buf);
+    free(data_buf);
+    return rc;
 }
